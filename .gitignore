@@ -1,0 +1,24 @@
+# Secret configurations and data
+*.db
+*.json
+!requirements.txt
+trace*.py
+test*.py
+py_trace*.txt
+trace_output*.txt
+check_*.py
+refactor_tk.py
+read_trace.py
+dump*.json
+
+# Cache and build folders
+__pycache__/
+build/
+*.spec
+backups/
+dist/backups/
+dist/*.db
+dist/*.json
+
+# Keep the executable
+!dist/finance_system.exe
