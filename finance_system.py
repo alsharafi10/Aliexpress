@@ -21,7 +21,8 @@ if getattr(sys, 'frozen', False):
     base_dir = sys._MEIPASS
 sys.path.append(os.path.join(base_dir, "utils"))
 
-from invoice_parser import parse_invoice_image
+from utils.invoice_parser import parse_invoice_image
+from utils import github_sync
 from tkinter import filedialog
 OCR_AVAILABLE = True
 
@@ -737,6 +738,41 @@ class FinanceSystemApp(ctk.CTkFrame):
         self.master.title(app_title)
 
         self.create_ui()
+        self.sync_from_github_bg()
+
+    def sync_from_github_bg(self):
+        def _sync():
+            try:
+                token = config_manager.get("github_token", "")
+                data = github_sync.download_data(token)
+                if data is not None:
+                    # Overwrite local database with remote json
+                    with db_manager.get_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM transactions")
+                        conn.commit()
+                    for t in data:
+                        db_manager.insert_transaction(t)
+                    # Refresh UI in the main thread
+                    if hasattr(self, 'refresh_transaction_log'):
+                        self.after(0, self.refresh_transaction_log)
+            except Exception as e:
+                print("GitHub sync download error:", e)
+        threading.Thread(target=_sync, daemon=True).start()
+
+    def sync_to_github_bg(self):
+        if self.role != "admin":
+            return
+        def _sync():
+            try:
+                token = config_manager.get("github_token", "")
+                if token:
+                    transactions = db_manager.get_all_transactions()
+                    github_sync.upload_data(transactions, token)
+            except Exception as e:
+                print("GitHub sync upload error:", e)
+        threading.Thread(target=_sync, daemon=True).start()
+
 
     def tr(self, key, default=None):
         """获取翻译文本，阿拉伯语自动修复RTL/连字显示"""
@@ -769,6 +805,9 @@ class FinanceSystemApp(ctk.CTkFrame):
         if OCR_AVAILABLE:
             self.api_key_btn = ctk.CTkButton(self.top_frame, text=self.tr("api_key_btn"), width=120, fg_color="#8B008B", hover_color="#4B0082", command=self.set_api_key)
             self.api_key_btn.pack(side="right", padx=5)
+
+        self.github_token_btn = ctk.CTkButton(self.top_frame, text="🔑 GitHub Token", width=120, fg_color="#2EA043", hover_color="#238636", command=self.set_github_token)
+        self.github_token_btn.pack(side="right", padx=5)
 
         # UI Priority 2: User Settings grouping (Next rightmost)
         right_frame = ctk.CTkFrame(self.top_frame, fg_color="transparent")
@@ -888,6 +927,14 @@ class FinanceSystemApp(ctk.CTkFrame):
             else:
                 config_manager.set("gemini_api_key", key.strip())
                 messagebox.showinfo("成功", "您的自定义 API 密钥已成功保存并立即生效！\n之后所有的订单截图都将采用您的专属密钥进行识别。")
+
+    def set_github_token(self):
+        dialog = ctk.CTkInputDialog(text="请在此输入您的 GitHub Personal Access Token:\n用于同步数据到远程仓库", title="配置 GitHub Token")
+        key = dialog.get_input()
+        if key is not None:
+            config_manager.set("github_token", key.strip())
+            messagebox.showinfo("成功", "GitHub Token 已保存！")
+            self.sync_from_github_bg()  # 尝试立刻同步
 
     def update_alignment(self):
         if self.current_lang == "ar":
@@ -1220,6 +1267,7 @@ class FinanceSystemApp(ctk.CTkFrame):
             trans_to_delete = display_list[len(display_list)-1-index]
             db_manager.delete_transaction(trans_to_delete)
             self.refresh_transaction_log()
+            self.sync_to_github_bg()
 
     # ==================== التبويب الرئيسي (معدل لاستخدام النسب المئوية) ====================
     def create_main_tab(self):
@@ -1612,6 +1660,7 @@ class FinanceSystemApp(ctk.CTkFrame):
         else:
             db_manager.insert_transaction(trans)
         self.refresh_transaction_log()
+        self.sync_to_github_bg()
         messagebox.showinfo(self.tr("success_saved"),
                             self.trf("success_saved", order_id))
 
@@ -1774,63 +1823,79 @@ class FinanceSystemApp(ctk.CTkFrame):
         file_path = filedialog.askopenfilename(title="选择订单截图", filetypes=[("Image files", "*.png *.jpg *.jpeg")])
         if not file_path:
             return
-            
+        
+        # Load API Key securely
+        api_key = config_manager.get("gemini_api_key", "").strip()
+        
+        if not api_key:
+            messagebox.showwarning(self.tr("warning_no_api_key"),
+                                   "API Key is missing! Please click '🔑 Set API Key' to configure your Gemini API Key first.")
+            return
+
         self.import_img_btn_main.configure(text="⏳ 识别中...", state="disabled")
         
-        def process():
+        def process_image():
+            self.result_textbox.delete("0.0", "end")
+            self.result_textbox.insert("end", f"{self.tr('ocr_processing')} {os.path.basename(file_path)}...\n")
+            self.calc_btn.configure(state="disabled")
+            
             try:
-                # Read user configured key, otherwise fallback to the default key
-                api_key = config_manager.get("gemini_api_key", "").strip()
-                if not api_key:
-                    api_key = "AIzaSyAwAD1bZz-OP5wtlv8hdY5zYnyZX2aKL-8"
-                    
-                data = parse_invoice_image(file_path, api_key)
+                # Use dynamic API Key from configuration instead of hardcoded
+                parsed_data = parse_invoice_image(file_path, api_key)
                 
                 def update_ui(success, result_data, error_msg=""):
                     self.import_img_btn_main.configure(text="📸 自动识别 AliExpress 订单截图填表", state="normal")
-                    if not success:
-                        messagebox.showerror("识别失败" if not error_msg else "识别错误", error_msg or "无法从图片中提取订单数据。")
-                        return
-
-                    # Fill fields safely on main thread
-                    self.order_id_entry.delete(0, 'end')
-                    self.order_id_entry.insert(0, str(result_data.get("order_id") or ""))
+                    self.calc_btn.configure(state="normal")
                     
-                    self.buyer_entry.delete(0, 'end')
-                    self.buyer_entry.insert(0, str(result_data.get("buyer_name") or ""))
-                    
-                    if result_data.get("order_total_cny"):
-                        usd_val = float(result_data["order_total_cny"]) / self.exchange_rate
+                    if success and result_data:
+                        self.result_textbox.insert("end", f"✔️ {self.tr('ocr_success')}\n\n", "success")
+                        
+                        # Populate UI using the result_data map
+                        self.order_id_entry.delete(0, 'end')
+                        if result_data.get("order_id"):
+                            self.order_id_entry.insert(0, str(result_data["order_id"]))
+                            
+                        self.buyer_entry.delete(0, 'end')
+                        if result_data.get("buyer_name"):
+                            self.buyer_entry.insert(0, str(result_data["buyer_name"]))
+                            
                         self.gross_order_entry.delete(0, 'end')
-                        self.gross_order_entry.insert(0, f"{usd_val:.2f}")
-                    
-                    if result_data.get("commission_rate_percent"):
+                        if result_data.get("order_total_usd"):
+                            self.gross_order_entry.insert(0, str(result_data["order_total_usd"]))
+                        elif result_data.get("order_total_cny"):
+                            usd_val = float(result_data["order_total_cny"]) / self.exchange_rate
+                            self.gross_order_entry.insert(0, f"{usd_val:.2f}")
+                            
                         self.commission_entry.delete(0, 'end')
-                        self.commission_entry.insert(0, str(result_data["commission_rate_percent"]))
-                        
-                    if result_data.get("transaction_service_rate_percent"):
+                        if result_data.get("commission_rate_percent"):
+                            self.commission_entry.insert(0, str(result_data["commission_rate_percent"]))
+                            
                         self.service_fee_entry.delete(0, 'end')
-                        self.service_fee_entry.insert(0, str(result_data["transaction_service_rate_percent"]))
-                        
-                    if result_data.get("incubation_service_rate_percent"):
+                        if result_data.get("transaction_service_rate_percent"):
+                            self.service_fee_entry.insert(0, str(result_data["transaction_service_rate_percent"]))
+                            
                         self.affiliate_fee_entry.delete(0, 'end')
-                        self.affiliate_fee_entry.insert(0, str(result_data["incubation_service_rate_percent"]))
-                    
-                    self.calculate()
-                    messagebox.showinfo("识别成功", "截图数据已成功导入并自动计算！")
+                        if result_data.get("incubation_service_rate_percent"):
+                            self.affiliate_fee_entry.insert(0, str(result_data["incubation_service_rate_percent"]))
 
-                if not data:
-                    self.after(0, update_ui, False, None, "无法从图片中提取订单数据。")
-                else:
-                    self.after(0, update_ui, True, data, "")
+                        self.update_funding_value()
+                        self.calculate()
+                        messagebox.showinfo(self.tr("ocr_success_title"), self.tr("ocr_success"))
+                    else:
+                        self.result_textbox.insert("end", f"❌ {self.tr('ocr_failed')}\n{error_msg}\n", "error")
+                        messagebox.showerror(self.tr("ocr_failed_title"), f"{self.tr('ocr_failed')}\n{error_msg}")
+
+                self.after(0, update_ui, True, parsed_data)
                 
             except Exception as e:
-                def show_err():
-                    self.import_img_btn_main.configure(text=self.tr("ocr_btn"), state="normal")
-                    messagebox.showerror("识别错误", f"处理时发生异常：{e}")
-                self.after(0, show_err)
-                
-        threading.Thread(target=process, daemon=True).start()
+                def update_ui_error(error_msg):
+                    self.import_img_btn_main.configure(text="📸 自动识别 AliExpress 订单截图填表", state="normal")
+                    self.calc_btn.configure(state="normal")
+                    self.result_textbox.insert("end", f"❌ {self.tr('ocr_failed')}\n{error_msg}\n", "error")
+                    messagebox.showerror(self.tr("ocr_failed_title"), f"{self.tr('ocr_failed')}\n{error_msg}")
+                self.after(0, update_ui_error, str(e))
+
+        threading.Thread(target=process_image, daemon=True).start()
 
     # ==================== 【新增】亏损预警 (Alerts) 标签页 ====================
     def create_alerts_tab(self):
