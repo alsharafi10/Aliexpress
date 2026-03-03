@@ -739,6 +739,8 @@ class FinanceSystemApp(ctk.CTkFrame):
 
         self.create_ui()
         self.sync_from_github_bg()
+        self._last_data_hash = None  # 用于检测数据是否有变化
+        self.start_periodic_sync()  # 启动定时同步
 
     def sync_from_github_bg(self):
         def _sync():
@@ -746,6 +748,17 @@ class FinanceSystemApp(ctk.CTkFrame):
                 token = config_manager.get("github_token", "")
                 data = github_sync.download_data(token)
                 if data is not None:
+                    # 计算远程数据的哈希值
+                    import hashlib
+                    data_str = json.dumps(data, sort_keys=True, ensure_ascii=False)
+                    new_hash = hashlib.md5(data_str.encode('utf-8')).hexdigest()
+                    
+                    # 如果数据没有变化，跳过更新
+                    if self._last_data_hash is not None and new_hash == self._last_data_hash:
+                        return
+                    
+                    self._last_data_hash = new_hash
+                    
                     # Overwrite local database with remote json
                     with db_manager.get_connection() as conn:
                         cursor = conn.cursor()
@@ -760,6 +773,23 @@ class FinanceSystemApp(ctk.CTkFrame):
                 print("GitHub sync download error:", e)
         threading.Thread(target=_sync, daemon=True).start()
 
+    def start_periodic_sync(self):
+        """启动定时同步，每5分钟自动从 GitHub 检查数据更新"""
+        self._sync_interval_ms = 5 * 60 * 1000  # 5分钟 = 300000毫秒
+        self._periodic_sync_tick()
+
+    def _periodic_sync_tick(self):
+        """定时同步的回调函数"""
+        try:
+            self.sync_from_github_bg()
+        except Exception as e:
+            print("Periodic sync error:", e)
+        # 安排下一次同步
+        try:
+            self.after(self._sync_interval_ms, self._periodic_sync_tick)
+        except Exception:
+            pass  # 窗口已关闭，忽略
+
     def sync_to_github_bg(self):
         if self.role != "admin":
             return
@@ -769,6 +799,10 @@ class FinanceSystemApp(ctk.CTkFrame):
                 if token:
                     transactions = db_manager.get_all_transactions()
                     github_sync.upload_data(transactions, token)
+                    # 上传后更新本地哈希，避免下次轮询时重复刷新
+                    import hashlib
+                    data_str = json.dumps(transactions, sort_keys=True, ensure_ascii=False)
+                    self._last_data_hash = hashlib.md5(data_str.encode('utf-8')).hexdigest()
             except Exception as e:
                 print("GitHub sync upload error:", e)
         threading.Thread(target=_sync, daemon=True).start()
